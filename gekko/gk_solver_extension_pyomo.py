@@ -67,6 +67,12 @@ class PyomoConverter(GKConverter):
             sqrt,
             # objects
             Piecewise,
+            # differential equation functions
+            TransformationFactory,
+        )
+        from pyomo.dae import (
+            DerivativeVar,
+            ContinuousSet,
         )
         self.ConcreteModel = ConcreteModel
         self.Var = Var
@@ -80,6 +86,9 @@ class PyomoConverter(GKConverter):
         self.Integers = Integers
         self.Reals = Reals
         self.value = value
+        self.ContinuousSet = ContinuousSet
+        self.DerivativeVar = DerivativeVar
+        self.TransformationFactory = TransformationFactory
 
         self._equation_operators = {
             "<=": lambda x, y: x <= y,
@@ -113,6 +122,8 @@ class PyomoConverter(GKConverter):
             "sigmd": lambda x: 1 / (1 + exp(-x)),
             # note that erf and erfc are not supported by pyomo
         }
+        # initialize using time to false
+        self._time = False
 
 
     def convert(self) -> None:
@@ -121,6 +132,11 @@ class PyomoConverter(GKConverter):
         """
         # create a new pyomo model object
         self._pyomo_model = self.ConcreteModel()
+        # setup time if required
+        if self._gekko_model.time is not None:
+            self._time = True
+            # add time as a ContinuousSet
+            self._pyomo_model.time = self.ContinuousSet(initialize=self._gekko_model.time)
         # call base class convert method
         super().convert()
 
@@ -157,8 +173,14 @@ class PyomoConverter(GKConverter):
         add a variable to the pyomo model
         """
         domain = self.Integers if variable["integer"] else self.Reals
-        pyomo_obj = self.Var(initialize=variable["value"], bounds=(variable["lower"], variable["upper"]), domain=domain)
-        self._pyomo_model.add_component(variable["name"], pyomo_obj)
+        if self._time:
+            pyomo_obj = self.Var(self._pyomo_model.time, initialize=variable["value"], bounds=(variable["lower"], variable["upper"]), domain=domain)
+            self._pyomo_model.add_component(variable["name"], pyomo_obj)
+            d_pyomo_obj = self.DerivativeVar(pyomo_obj, wrt=self._pyomo_model.time)
+            self._pyomo_model.add_component("d_" + variable["name"], d_pyomo_obj)
+        else:
+            pyomo_obj = self.Var(initialize=variable["value"], bounds=(variable["lower"], variable["upper"]), domain=domain)
+            self._pyomo_model.add_component(variable["name"], pyomo_obj)
 
     
     def add_intermediate(self, intermediate) -> None:
@@ -183,18 +205,32 @@ class PyomoConverter(GKConverter):
         # reset the expression index
         self._expr_index = 0
         # find the expression
-        expression = self.expression(constraint)
-        # create a pyomo constraint object
-        pyomo_obj = self.Constraint(expr=expression)
-        self._pyomo_model.add_component("constraint" + str(self._equations_num), pyomo_obj)
+        if self._time:
+            # differential equation
+            def ode_rule(m, t):
+                # if t == m.time.first():
+                #     return self.Constraint.Skip
+                e = self.expression(constraint, m, t)
+                print(e)
+                print("all done")
+                return e
+            ode = self.Constraint(self._pyomo_model.time, rule=ode_rule)
+            self._pyomo_model.add_component("ode" + str(self._equations_num), ode)
+        else:
+            expression = self.expression(constraint)
+            # create a pyomo constraint object
+            pyomo_obj = self.Constraint(expr=expression)
+            self._pyomo_model.add_component("constraint" + str(self._equations_num), pyomo_obj)
 
 
-    def expression(self, expr):
+    def expression(self, expr, m=None, t=None):
         """
         find a sub-expression
         """
+        print(expr)
         # find the left side of the expression
-        left = self.expr_var(expr, left=True)
+        left = self.expr_var(expr, left=True, m=m, t=t)
+        print(left, self._expr_index, len(expr))
         if self._expr_index == len(expr) or expr[self._expr_index] == ")":
             # reached the end
             return left
@@ -202,11 +238,12 @@ class PyomoConverter(GKConverter):
         operator = self.expr_get_operator(expr)
         self._expr_index += len(operator)
         # find the right side of the expression
-        right = self.expr_var(expr, left=False)
+        right = self.expr_var(expr, left=False, m=m, t=t)
+        print(right, self._expr_index, len(expr))
         return self._equation_operators[operator](left, right)
     
 
-    def expr_var(self, expr, left=True):
+    def expr_var(self, expr, left=True, m=None, t=None):
         """
         find a variable in an expression
         """
@@ -230,11 +267,20 @@ class PyomoConverter(GKConverter):
             var += expr[self._expr_index]
             self._expr_index += 1
         # now we have the variable as a string, we need to find the component in the pyomo object
-        pyomo_obj = self._pyomo_model.find_component(var)
-        if pyomo_obj is None:
-            # if the variable is not found, it is a constant
-            return float(var)
-        return pyomo_obj
+        if self._time:
+            # wrt time
+            if var[0] == "$":
+                # derivative
+                return getattr(m, "d_" + var[1:])[t]
+            else:
+                return getattr(m, var)[t]
+        else:
+            # not wrt time
+            pyomo_obj = self._pyomo_model.find_component(var)
+            if pyomo_obj is None:
+                # if the variable is not found, it is a constant
+                return float(var)
+            return pyomo_obj
 
 
     def expr_get_operator(self, expr):
@@ -382,6 +428,10 @@ class PyomoConverter(GKConverter):
         """
         solve the pyomo model
         """
+        if self._time:
+            # discretize the model using the finite difference method
+            discretizer = self.TransformationFactory("dae.finite_difference")
+            discretizer.apply_to(self._pyomo_model, nfe=len(self._gekko_model.time) - 1, scheme="BACKWARD")
         # solve the model
         results = self._solver.solve(self._pyomo_model, tee=True)
         # check the results
